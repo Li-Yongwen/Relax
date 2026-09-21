@@ -16,7 +16,10 @@ import torch
 from relax.utils import device
 from relax.utils.device import AcceleratorType, BackendSpec, Mod
 
-_CPU_ONLY = not torch.cuda.is_available()
+# Machine-independent "CPU-only" check: ask the module under test, so an NPU
+# host (where torch.cuda is also unavailable) is correctly treated as
+# non-CPU-only and the CpuHost suite is skipped there too.
+_CPU_ONLY = device.get_device_name() == "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +119,9 @@ def _patch_family_probe(monkeypatch, accel: AcceleratorType, probe) -> None:
 
 
 def test_device_detection_rocm_before_klx(monkeypatch) -> None:
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # Suppress every plugin probe so only the cuda family is detectable,
+    # regardless of which accelerators the host machine really has.
+    monkeypatch.setattr(device, "_is_mod_available", lambda name: name == "cuda")
     _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: True)
     _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: True)
     device._detect_accelerator.cache_clear()
@@ -127,7 +132,7 @@ def test_device_detection_rocm_before_klx(monkeypatch) -> None:
 
 
 def test_device_detection_cuda_when_no_subfamily(monkeypatch) -> None:
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(device, "_is_mod_available", lambda name: name == "cuda")
     _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: False)
     _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: False)
     device._detect_accelerator.cache_clear()
