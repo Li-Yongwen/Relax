@@ -149,6 +149,18 @@ _RAY_RESOURCE_TO_ACCEL = {
     spec.ray_resource: accel for accel, spec in reversed(_BACKEND.items()) if spec.ray_resource != "CPU"
 }
 
+# Ray-resource probe order for cluster-based detection: plugin namespaces in
+# _BACKEND declaration order, then the CUDA family's Ray resource ("GPU",
+# which matches any CUDA-family accelerator) — mirrors _detect_accelerator().
+_RAY_PROBE_ORDER = (
+    *(
+        spec.ray_resource
+        for accel, spec in _BACKEND.items()
+        if spec.torch_namespace != "cuda" and accel is not AcceleratorType.CPU
+    ),
+    _BACKEND[AcceleratorType.CUDA].ray_resource,
+)
+
 
 # ---------------------------------------------------------------------------
 # Accelerator detection & resolution
@@ -205,8 +217,8 @@ def _detect_accelerator_from_ray_cluster() -> Optional[AcceleratorType]:
         if not ray.is_initialized():
             return None
         resources = ray.cluster_resources()
-        # Priority order matches _detect_accelerator(): NPU > XPU > PPU > GPU.
-        for ray_key in ("NPU", "XPU", "PPU", "GPU"):
+        # Probe order mirrors _detect_accelerator(): plugins first, then GPU.
+        for ray_key in _RAY_PROBE_ORDER:
             if resources.get(ray_key, 0) > 0:
                 accel = _RAY_RESOURCE_TO_ACCEL[ray_key]
                 logger.info(
@@ -285,17 +297,10 @@ def get_device_name() -> str:
     """Return the PyTorch device type string (``'cuda'``, ``'npu'``, ``'xpu'``,
     etc.).
 
-    For ROCm, returns ``'cuda'`` because PyTorch ROCm uses the CUDA device
-    namespace.
+    ROCm / KLX resolve to ``'cuda'`` via their ``torch_namespace``: PyTorch
+    ROCm and Kunlunxin both use the CUDA device namespace.
     """
-    accel = _detect_accelerator()
-    if accel == AcceleratorType.ROCM:
-        return "cuda"  # ROCm uses torch.cuda namespace
-    if accel == AcceleratorType.KLX:
-        return "cuda"  # Kunlunxin KLX masquerades as CUDA
-    if accel == AcceleratorType.CPU:
-        return "cpu"
-    return accel.value
+    return _spec(_detect_accelerator()).torch_namespace
 
 
 def get_torch_device_module():
