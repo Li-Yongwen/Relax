@@ -8,13 +8,6 @@
 # This module provides a unified device abstraction that allows Relax to run
 # on multiple hardware backends (NVIDIA CUDA, Ascend NPU, AMD ROCm, Kunlunxin XPU,
 # PPU, etc.) with minimal code changes throughout the framework.
-#
-# Usage:
-#   from relax.utils.device import get_device_name, get_torch_device_module, device_module
-#   device_module.current_device()  # torch API wrappers dispatch to torch.<device>
-#
-# The module auto-detects the available accelerator at import time and exposes
-# a consistent API regardless of the underlying hardware.
 
 import os
 from dataclasses import dataclass
@@ -80,8 +73,6 @@ def _is_rocm() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
-# Convenience: boolean flags (for backward compatibility / quick checks) —
-# import-time snapshots of the probes above.
 is_cuda_available: bool = torch.cuda.is_available()
 is_npu_available: bool = _is_torch_device_module_available("npu")
 is_xpu_available: bool = _is_torch_device_module_available("xpu")
@@ -94,36 +85,23 @@ is_rocm: bool = _is_rocm()
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class BackendSpec:
-    """Per-accelerator backend specification (single source of truth).
+    """Per-accelerator backend specification.
 
-    Adding a new accelerator only requires:
-    1. a new ``AcceleratorType`` member,
-    2. one new row in :data:`_BACKEND`.
-
-    Everything else — detection probes, dist backend, env var, Ray resource,
-    torch module resolution, capability flags — is derived from the row.
+    Adding a new accelerator requires only a new ``AcceleratorType`` member
+    plus one row in :data:`_BACKEND`; everything else is derived from it.
     """
 
     dist_backend: str  # default collective communication backend
     visible_devices_env: str  # env var controlling visible devices
     ray_resource: str  # Ray resource name
     torch_namespace: str  # torch.<ns> module backing this accelerator
-    # Subfamily test used when the shared "cuda" namespace is available
-    # (ROCm / KLX masquerade as CUDA). None for plain CUDA.
+    # Subfamily test for the shared "cuda" namespace; None for plain CUDA.
     cuda_family_probe: Optional[Callable[[], bool]] = None
     allow_non_blocking_copy: bool = True  # async host<->device copies OK?
     allow_pinned_host_memory: bool = True  # pinned host tensors OK?
 
 
-# The single backend table — one row per AcceleratorType. Notes:
-# - ROCm: RCCL is NCCL-compatible; also honours HIP_VISIBLE_DEVICES.
-# - KLX: Kunlunxin masquerades as CUDA (nccl + CUDA_VISIBLE_DEVICES + GPU),
-#   and its runtime does not support non_blocking copies / pinned memory.
-# - CPU: empty visible-devices env var (nothing to hide).
-# Row order matters for detection: plugin namespaces are probed in order,
-# then the cuda family is refined in order (ROCM before KLX).
 _BACKEND = {
-    #                    dist_backend  visible_devices_env           ray_resource  torch_ns  family_probe
     AcceleratorType.CUDA: BackendSpec("nccl", "CUDA_VISIBLE_DEVICES", "GPU", "cuda"),
     AcceleratorType.ROCM: BackendSpec("nccl", "CUDA_VISIBLE_DEVICES", "GPU", "cuda", cuda_family_probe=_is_rocm),
     AcceleratorType.NPU: BackendSpec("hccl", "ASCEND_RT_VISIBLE_DEVICES", "NPU", "npu"),
@@ -148,17 +126,10 @@ def _spec(accel: AcceleratorType) -> BackendSpec:
     return _BACKEND.get(accel, _BACKEND[AcceleratorType.CUDA])
 
 
-# Reverse lookup derived from _BACKEND: Ray resource name → the canonical
-# accelerator that owns it. ``reversed()`` + dict last-write-wins leaves CUDA
-# as the owner of "GPU" (ROCm/KLX also report as GPU); "CPU" is not an
-# accelerator resource and is excluded.
 _RAY_RESOURCE_TO_ACCEL = {
     spec.ray_resource: accel for accel, spec in reversed(_BACKEND.items()) if spec.ray_resource != "CPU"
 }
 
-# Ray-resource probe order for cluster-based detection: plugin namespaces in
-# _BACKEND declaration order, then the CUDA family's Ray resource ("GPU",
-# which matches any CUDA-family accelerator) — mirrors _detect_accelerator().
 _RAY_PROBE_ORDER = (
     *(
         spec.ray_resource
@@ -179,7 +150,6 @@ def _detect_accelerator() -> AcceleratorType:
     Detection order follows specificity: NPU > XPU > PPU > CUDA/ROCm/KLX > CPU.
     Environment variable ``RELAX_DEVICE_TYPE`` can override auto-detection.
     """
-    # Allow explicit override via environment variable
     override = Envs.RELAX_DEVICE_TYPE.lower().strip()
     if override:
         for accel in AcceleratorType:
@@ -188,17 +158,14 @@ def _detect_accelerator() -> AcceleratorType:
                 return accel
         logger.warning(f"Unknown RELAX_DEVICE_TYPE='{override}', falling back to auto-detection")
 
-    # Independent plugin namespaces (torch.npu / torch.xpu / torch.ppu ...),
-    # probed in _BACKEND declaration order. Rows sharing the "cuda"
-    # namespace are handled below; CPU is the final fallback.
+    # Independent plugin namespaces in _BACKEND order; CPU is the fallback.
     for accel, spec in _BACKEND.items():
         if spec.torch_namespace == "cuda" or accel is AcceleratorType.CPU:
             continue
         if _is_torch_device_module_available(spec.torch_namespace):
             return accel
 
-    # CUDA family (NVIDIA / ROCm / KLX all expose torch.cuda): refine in
-    # _BACKEND declaration order, plain CUDA is the family head / fallback.
+    # CUDA family: refine by family probe; plain CUDA is the fallback.
     if _is_torch_device_module_available("cuda"):
         for accel, spec in _BACKEND.items():
             if spec.cuda_family_probe is not None and spec.cuda_family_probe():
@@ -224,7 +191,6 @@ def _detect_accelerator_from_ray_cluster() -> Optional[AcceleratorType]:
         if not ray.is_initialized():
             return None
         resources = ray.cluster_resources()
-        # Probe order mirrors _detect_accelerator(): plugins first, then GPU.
         for ray_key in _RAY_PROBE_ORDER:
             if resources.get(ray_key, 0) > 0:
                 accel = _RAY_RESOURCE_TO_ACCEL[ray_key]
@@ -240,26 +206,13 @@ def _detect_accelerator_from_ray_cluster() -> Optional[AcceleratorType]:
 
 
 def _current_accelerator() -> AcceleratorType:
-    """Detect accelerator with Ray-cluster fallback, for actor-configuration
-    values.
+    """Accelerator for actor-configuration values (dist backend, Ray resource
+    name, visible-devices env var), unlike the local-only
+    :func:`_detect_accelerator`.
 
-    Use this for values that configure REMOTE actors (dist backend, Ray
-    resource name, visible-devices env var). On a CPU-only Ray driver/head,
-    the local probe returns CPU but the cluster usually has GPUs/NPUs/etc.;
-    we query ``ray.cluster_resources()`` to recover the right answer.
-
-    LOCAL operations (set_device, synchronize, current_device, ...) must keep
-    using :func:`_detect_accelerator` so they don't pretend the local process
-    owns a GPU.
-
-    Resolution order:
-    1. Local accelerator if present.
-    2. Ray cluster resources if Ray is initialised.
-    3. CUDA default — Relax trains on GPUs, and the typical "neither fires"
-       case is the driver at parse-args time, before ``ray.init()`` runs.
-
-    Not cached: a call before ``ray.init`` must not poison later calls that
-    happen after the cluster is up.
+    Resolution: local accelerator → Ray cluster resources if Ray is
+    initialised → CUDA default (the typical pre-``ray.init`` driver case).
+    Deliberately not cached.
     """
     accel = _detect_accelerator()
     if accel != AcceleratorType.CPU:
@@ -276,11 +229,8 @@ def _current_accelerator() -> AcceleratorType:
         cluster_accel = _detect_accelerator_from_ray_cluster()
         if cluster_accel is not None:
             return cluster_accel
-        # Ray is up and the cluster is genuinely accelerator-free.
         return AcceleratorType.CPU
 
-    # Ray not initialised yet — common at parse-args time on the driver.
-    # Default to CUDA so actor-configuration values stay usable.
     return AcceleratorType.CUDA
 
 
@@ -301,22 +251,13 @@ def ray_get_device_ids():
 
 
 def get_device_name() -> str:
-    """Return the PyTorch device type string (``'cuda'``, ``'npu'``, ``'xpu'``,
-    etc.).
-
-    ROCm / KLX resolve to ``'cuda'`` via their ``torch_namespace``: PyTorch
-    ROCm and Kunlunxin both use the CUDA device namespace.
-    """
+    """Return the PyTorch device type string (``'cuda'``, ``'npu'``, ...)."""
     return _spec(_detect_accelerator()).torch_namespace
 
 
 def get_torch_device_module():
-    """Return the ``torch.<device>`` module backing the active accelerator.
-
-    E.g. ``torch.cuda``, ``torch.npu``; ROCm / KLX rows resolve to
-    ``torch.cuda`` via their ``torch_namespace``. This is the namespace that
-    provides ``current_device()``, ``synchronize()``, ``empty_cache()``, etc.
-    """
+    """Return the ``torch.<device>`` module for the active accelerator (e.g.
+    ``torch.cuda``, ``torch.npu``)."""
     ns = _spec(_detect_accelerator()).torch_namespace
     device_module = getattr(torch, ns, None)
     if device_module is None:  # e.g. RELAX_DEVICE_TYPE=npu on a host without torch_npu
@@ -389,20 +330,13 @@ def get_ray_accelerator_name() -> str:
 # Public API — device operations (thin wrappers)
 # ---------------------------------------------------------------------------
 class DeviceModule:
-    """Unified namespace wrapping the ``torch.<device>`` module operations.
+    """Single-object facade over the ``torch.<device>`` module returned by
+    :func:`get_torch_device_module`.
 
-    Wraps the per-backend device module returned by
-    :func:`get_torch_device_module` (``torch.cuda``, ``torch.npu``,
-    ``torch.xpu``, ...) behind a single object, so callers use
-    ``device_module.current_device()``, ``device_module.synchronize()``,
-    etc. regardless of the underlying hardware.
-
-    Pure pass-throughs (``current_device``, ``set_device``, ``device_count``,
-    ``Event``, ...) are not declared here — the instance ``__getattr__``
-    forwards them to the active device module on access. Only operations
-    with extra dispatch logic (CPU no-ops, ``device=None`` handling, name
-    mapping, fallbacks) are declared explicitly, and they take precedence
-    over the forwarding.
+    Undeclared attributes (``current_device``, ``set_device``, ``Event``,
+    ...) forward to the active device module on every access; operations
+    with extra dispatch logic are declared explicitly below and take
+    precedence over the forwarding.
     """
 
     def __getattr__(self, name: str):
@@ -489,14 +423,9 @@ class DeviceModule:
         mod = get_torch_device_module()
         if hasattr(mod, "is_initialized"):
             return mod.is_initialized()
-        # Fallback: if the backend doesn't expose is_initialized, check if
-        # any device is available (conservative — assumes initialized if available).
         return is_available()
 
 
-# The single exported instance — no Singleton metaclass needed: the module
-# attribute itself is the singleton, and every attribute access re-resolves
-# the backend module (never cached at construction time).
 device_module = DeviceModule()
 
 
@@ -504,11 +433,8 @@ device_module = DeviceModule()
 # Public API — device string helpers
 # ---------------------------------------------------------------------------
 def make_device_string(index: Optional[int] = None) -> str:
-    """Build a device string like ``'cuda:0'`` or ``'npu:2'``.
-
-    Args:
-        index: Device index. If None, uses :meth:`DeviceModule.current_device`.
-    """
+    """Build a device string like ``'cuda:0'`` / ``'npu:2'``; ``index=None``
+    resolves to the current device."""
     name = get_device_name()
     if name == "cpu":
         return "cpu"
@@ -578,10 +504,7 @@ def is_available() -> bool:
 
 
 def is_klx() -> bool:
-    """Return True if running on a Kunlunxin (KLX) accelerator (detected via.
-
-    /dev/xpuctrl).
-    """
+    """Return True if running on a Kunlunxin (KLX) accelerator."""
     return _is_klx()
 
 
