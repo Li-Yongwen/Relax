@@ -2,9 +2,9 @@
 """Tests for ``relax.utils.device``.
 
 Focuses on the ``_BACKEND`` single-source-of-truth table: data integrity,
-derived lookups, and the table-driven detection order. Adding a new
-accelerator should only require a new ``AcceleratorType`` member plus one
-``_BACKEND`` row — these tests lock that contract down.
+derived lookups, and the table-driven detection order. Adding a new accelerator
+should only require a new ``AcceleratorType`` member plus one ``_BACKEND`` row
+— these tests lock that contract down.
 """
 
 import types
@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from relax.utils import device
-from relax.utils.device import AcceleratorType, BackendSpec, Mod
+from relax.utils.device import AcceleratorType, BackendSpec, device_module
+
 
 # Machine-independent "CPU-only" check: ask the module under test, so an NPU
 # host (where torch.cuda is also unavailable) is correctly treated as
@@ -114,14 +115,15 @@ def test_device_override_env_unknown_value_autodetects(monkeypatch) -> None:
 
 
 def _patch_family_probe(monkeypatch, accel: AcceleratorType, probe) -> None:
-    """Swap a table row's cuda-family probe (frozen rows need a row replace)."""
+    """Swap a table row's cuda-family probe (frozen rows need a row
+    replace)."""
     monkeypatch.setitem(device._BACKEND, accel, replace(device._BACKEND[accel], cuda_family_probe=probe))
 
 
 def test_device_detection_rocm_before_klx(monkeypatch) -> None:
     # Suppress every plugin probe so only the cuda family is detectable,
     # regardless of which accelerators the host machine really has.
-    monkeypatch.setattr(device, "_is_mod_available", lambda name: name == "cuda")
+    monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: name == "cuda")
     _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: True)
     _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: True)
     device._detect_accelerator.cache_clear()
@@ -132,7 +134,7 @@ def test_device_detection_rocm_before_klx(monkeypatch) -> None:
 
 
 def test_device_detection_cuda_when_no_subfamily(monkeypatch) -> None:
-    monkeypatch.setattr(device, "_is_mod_available", lambda name: name == "cuda")
+    monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: name == "cuda")
     _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: False)
     _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: False)
     device._detect_accelerator.cache_clear()
@@ -194,12 +196,29 @@ class TestDeviceCpuHost:
     def test_get_accelerator_type(self) -> None:
         assert device.get_accelerator_type() is AcceleratorType.CPU
 
-    def test_config_query_apis_use_cuda_default(self) -> None:
+    def test_config_query_apis_use_cuda_default(self, monkeypatch) -> None:
         # No Ray runtime: _current_accelerator falls back to the CUDA default
         # so actor-configuration values stay usable on the driver.
+        # Pin the Ray state explicitly: other test modules run module-level
+        # ray.init() at collection time, which would otherwise flip this
+        # resolution to the CPU cluster branch ("gloo").
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
         assert device.get_dist_backend() == "nccl"
         assert device.get_visible_devices_env_var() == "CUDA_VISIBLE_DEVICES"
         assert device.get_ray_accelerator_name() == "GPU"
+
+    def test_config_query_apis_use_gloo_on_initialized_cpu_cluster(self, monkeypatch) -> None:
+        # Counterpart: with an initialized, accelerator-free Ray cluster the
+        # config queries must report the true cluster backend (CPU -> gloo)
+        # instead of the CUDA default. No real ray.init() needed — the two
+        # probed entry points are stubbed.
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 8})
+        assert device.get_dist_backend() == "gloo"
+        assert device.get_visible_devices_env_var() == ""
+        assert device.get_ray_accelerator_name() == "CPU"
 
     def test_make_device_string(self) -> None:
         assert device.make_device_string() == "cpu"
@@ -216,11 +235,11 @@ class TestDeviceCpuHost:
         assert device.is_available() is False
 
     def test_mod_current_device(self) -> None:
-        assert Mod.current_device() == "cpu"
+        assert device_module.current_device() == "cpu"
 
     def test_mod_attribute_proxy_forwards_to_torch_module(self) -> None:
-        assert Mod.Event is torch.cpu.Event  # undeclared attrs forward via the metaclass
+        assert device_module.Event is torch.cpu.Event  # undeclared attrs forward via instance __getattr__
 
     def test_mod_unknown_attribute_raises(self) -> None:
         with pytest.raises(AttributeError):
-            Mod.definitely_not_a_torch_api
+            device_module.definitely_not_a_torch_api

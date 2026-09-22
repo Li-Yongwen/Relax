@@ -10,8 +10,8 @@
 # PPU, etc.) with minimal code changes throughout the framework.
 #
 # Usage:
-#   from relax.utils.device import get_device_name, get_torch_device_module, Mod
-#   Mod.current_device()  # torch API wrappers dispatch to torch.<device>
+#   from relax.utils.device import get_device_name, get_torch_device_module, device_module
+#   device_module.current_device()  # torch API wrappers dispatch to torch.<device>
 #
 # The module auto-detects the available accelerator at import time and exposes
 # a consistent API regardless of the underlying hardware.
@@ -49,7 +49,7 @@ class AcceleratorType(str, Enum):
 # ---------------------------------------------------------------------------
 # Probes — low-level availability checks
 # ---------------------------------------------------------------------------
-def _is_mod_available(name: str) -> bool:
+def _is_torch_device_module_available(name: str) -> bool:
     """Check if the ``torch.<name>`` plugin backend exists and is available.
 
     Covers ``torch.npu`` / ``torch.xpu`` / ``torch.ppu`` style plugin
@@ -57,10 +57,10 @@ def _is_mod_available(name: str) -> bool:
     (attribute access may trigger the plugin import).
     """
     try:
-        mod = getattr(torch, name, None)
-        if mod is None:
+        device_module = getattr(torch, name, None)
+        if device_module is None:
             return False
-        return mod.is_available()
+        return device_module.is_available()
     except (ImportError, AttributeError):
         return False
 
@@ -83,9 +83,9 @@ def _is_rocm() -> bool:
 # Convenience: boolean flags (for backward compatibility / quick checks) —
 # import-time snapshots of the probes above.
 is_cuda_available: bool = torch.cuda.is_available()
-is_npu_available: bool = _is_mod_available("npu")
-is_xpu_available: bool = _is_mod_available("xpu")
-is_ppu_available: bool = _is_mod_available("ppu")
+is_npu_available: bool = _is_torch_device_module_available("npu")
+is_xpu_available: bool = _is_torch_device_module_available("xpu")
+is_ppu_available: bool = _is_torch_device_module_available("ppu")
 is_rocm: bool = _is_rocm()
 
 
@@ -130,16 +130,23 @@ _BACKEND = {
     AcceleratorType.XPU: BackendSpec("xccl", "XPU_VISIBLE_DEVICES", "XPU", "xpu"),
     AcceleratorType.PPU: BackendSpec("eccl", "PPU_VISIBLE_DEVICES", "PPU", "ppu"),
     AcceleratorType.KLX: BackendSpec(
-        "nccl", "CUDA_VISIBLE_DEVICES", "GPU", "cuda", cuda_family_probe=_is_klx,
-        allow_non_blocking_copy=False, allow_pinned_host_memory=False,
+        "nccl",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU",
+        "cuda",
+        cuda_family_probe=_is_klx,
+        allow_non_blocking_copy=False,
+        allow_pinned_host_memory=False,
     ),
     AcceleratorType.CPU: BackendSpec("gloo", "", "CPU", "cpu"),
 }
 
 
 def _spec(accel: AcceleratorType) -> BackendSpec:
-    """Return the :class:`BackendSpec` for ``accel``, falling back to CUDA's."""
+    """Return the :class:`BackendSpec` for ``accel``, falling back to
+    CUDA's."""
     return _BACKEND.get(accel, _BACKEND[AcceleratorType.CUDA])
+
 
 # Reverse lookup derived from _BACKEND: Ray resource name → the canonical
 # accelerator that owns it. ``reversed()`` + dict last-write-wins leaves CUDA
@@ -187,12 +194,12 @@ def _detect_accelerator() -> AcceleratorType:
     for accel, spec in _BACKEND.items():
         if spec.torch_namespace == "cuda" or accel is AcceleratorType.CPU:
             continue
-        if _is_mod_available(spec.torch_namespace):
+        if _is_torch_device_module_available(spec.torch_namespace):
             return accel
 
     # CUDA family (NVIDIA / ROCm / KLX all expose torch.cuda): refine in
     # _BACKEND declaration order, plain CUDA is the family head / fallback.
-    if _is_mod_available("cuda"):
+    if _is_torch_device_module_available("cuda"):
         for accel, spec in _BACKEND.items():
             if spec.cuda_family_probe is not None and spec.cuda_family_probe():
                 return accel
@@ -311,16 +318,17 @@ def get_torch_device_module():
     provides ``current_device()``, ``synchronize()``, ``empty_cache()``, etc.
     """
     ns = _spec(_detect_accelerator()).torch_namespace
-    mod = getattr(torch, ns, None)
-    if mod is None:  # e.g. RELAX_DEVICE_TYPE=npu on a host without torch_npu
+    device_module = getattr(torch, ns, None)
+    if device_module is None:  # e.g. RELAX_DEVICE_TYPE=npu on a host without torch_npu
         logger.warning(f"torch.{ns} not found, falling back to torch.cuda")
         return torch.cuda
-    return mod
+    return device_module
 
 
 # ---------------------------------------------------------------------------
 # Public API — distributed backend
 # ---------------------------------------------------------------------------
+
 
 def get_dist_backend() -> str:
     """Return the default distributed communication backend name.
@@ -336,6 +344,7 @@ def get_dist_backend() -> str:
 # ---------------------------------------------------------------------------
 # Public API — environment variables
 # ---------------------------------------------------------------------------
+
 
 def get_visible_devices_env_var() -> str:
     """Return the environment variable name for controlling visible devices.
@@ -362,6 +371,7 @@ def get_visible_devices() -> Optional[str]:
 # Public API — Ray resource name
 # ---------------------------------------------------------------------------
 
+
 def get_ray_accelerator_name() -> str:
     """Return the Ray resource name for the current accelerator.
 
@@ -378,37 +388,27 @@ def get_ray_accelerator_name() -> str:
 # ---------------------------------------------------------------------------
 # Public API — device operations (thin wrappers)
 # ---------------------------------------------------------------------------
-class _ModProxy(type):
-    """Metaclass forwarding unresolved attribute access on :class:`Mod` to the
-    active ``torch.<device>`` module.
-
-    Resolution stays lazy (on each access), preserving the late-binding
-    semantics of :func:`get_torch_device_module`.
-    """
-
-    def __getattr__(cls, name: str):
-        return getattr(get_torch_device_module(), name)
-
-
-class Mod(metaclass=_ModProxy):
+class DeviceModule:
     """Unified namespace wrapping the ``torch.<device>`` module operations.
 
     Wraps the per-backend device module returned by
     :func:`get_torch_device_module` (``torch.cuda``, ``torch.npu``,
-    ``torch.xpu``, ...) behind a single class, so callers use
-    ``Mod.current_device()``, ``Mod.synchronize()``, etc. regardless of the
-    underlying hardware.
+    ``torch.xpu``, ...) behind a single object, so callers use
+    ``device_module.current_device()``, ``device_module.synchronize()``,
+    etc. regardless of the underlying hardware.
 
     Pure pass-throughs (``current_device``, ``set_device``, ``device_count``,
-    ``Event``, ...) are not declared here — the ``_ModProxy`` metaclass
+    ``Event``, ...) are not declared here — the instance ``__getattr__``
     forwards them to the active device module on access. Only operations
     with extra dispatch logic (CPU no-ops, ``device=None`` handling, name
     mapping, fallbacks) are declared explicitly, and they take precedence
-    over the metaclass forwarding.
+    over the forwarding.
     """
 
-    @staticmethod
-    def synchronize(device=None) -> None:
+    def __getattr__(self, name: str):
+        return getattr(get_torch_device_module(), name)
+
+    def synchronize(self, device=None) -> None:
         """Synchronize the current (or specified) device."""
         accel = _detect_accelerator()
         if accel == AcceleratorType.CPU:
@@ -419,8 +419,7 @@ class Mod(metaclass=_ModProxy):
         else:
             mod.synchronize()
 
-    @staticmethod
-    def empty_cache() -> None:
+    def empty_cache(self) -> None:
         """Release all unoccupied cached memory."""
         accel = _detect_accelerator()
         if accel == AcceleratorType.CPU:
@@ -428,16 +427,14 @@ class Mod(metaclass=_ModProxy):
         mod = get_torch_device_module()
         mod.empty_cache()
 
-    @staticmethod
-    def memory_allocated(device=None) -> int:
+    def memory_allocated(self, device=None) -> int:
         """Return the current GPU memory occupied by tensors in bytes."""
         mod = get_torch_device_module()
         if device is not None:
             return mod.memory_allocated(device)
         return mod.memory_allocated()
 
-    @staticmethod
-    def memory_reserved(device=None) -> int:
+    def memory_reserved(self, device=None) -> int:
         """Return the current GPU memory managed by the caching allocator in
         bytes."""
         mod = get_torch_device_module()
@@ -445,55 +442,49 @@ class Mod(metaclass=_ModProxy):
             return mod.memory_reserved(device)
         return mod.memory_reserved()
 
-    @staticmethod
-    def mem_get_info(device=None):
+    def mem_get_info(self, device=None):
         """Return ``(free, total)`` memory in bytes for the given device."""
         mod = get_torch_device_module()
         if device is not None:
             return mod.mem_get_info(device)
         return mod.mem_get_info()
 
-    @staticmethod
-    def get_device_properties(device=None):
+    def get_device_properties(self, device=None):
         """Return device properties for the given device."""
         mod = get_torch_device_module()
         if device is not None:
             return mod.get_device_properties(device)
         return mod.get_device_properties(mod.current_device())
 
-    @staticmethod
-    def current_stream(device=None):
+    def current_stream(self, device=None):
         """Return the currently selected stream for the given device."""
         mod = get_torch_device_module()
         if device is not None:
             return mod.current_stream(device)
         return mod.current_stream()
 
-    @staticmethod
-    def Stream(device=None, **kwargs):
+    def Stream(self, device=None, **kwargs):
         """Create a new stream on the given device."""
         mod = get_torch_device_module()
         if device is not None:
             return mod.Stream(device=device, **kwargs)
         return mod.Stream(**kwargs)
 
-    @staticmethod
-    def stream_context(stream):
+    def stream_context(self, stream):
         """Return a context manager that sets the given stream as the current
         stream.
 
-        Equivalent to ``torch.cuda.stream(s)`` but dispatches to the correct device
-        backend (e.g. ``torch.npu.stream(s)`` on Ascend NPU).
+        Equivalent to ``torch.cuda.stream(s)`` but dispatches to the correct
+        device backend (e.g. ``torch.npu.stream(s)`` on Ascend NPU).
         """
         mod = get_torch_device_module()
         return mod.stream(stream)
 
-    @staticmethod
-    def is_initialized() -> bool:
+    def is_initialized(self) -> bool:
         """Return True if the device backend has been initialized.
 
-        Equivalent to ``torch.cuda.is_initialized()`` but dispatches to the correct
-        device backend.
+        Equivalent to ``torch.cuda.is_initialized()`` but dispatches to the
+        correct device backend.
         """
         mod = get_torch_device_module()
         if hasattr(mod, "is_initialized"):
@@ -503,6 +494,12 @@ class Mod(metaclass=_ModProxy):
         return is_available()
 
 
+# The single exported instance — no Singleton metaclass needed: the module
+# attribute itself is the singleton, and every attribute access re-resolves
+# the backend module (never cached at construction time).
+device_module = DeviceModule()
+
+
 # ---------------------------------------------------------------------------
 # Public API — device string helpers
 # ---------------------------------------------------------------------------
@@ -510,13 +507,13 @@ def make_device_string(index: Optional[int] = None) -> str:
     """Build a device string like ``'cuda:0'`` or ``'npu:2'``.
 
     Args:
-        index: Device index. If None, uses :meth:`Mod.current_device`.
+        index: Device index. If None, uses :meth:`DeviceModule.current_device`.
     """
     name = get_device_name()
     if name == "cpu":
         return "cpu"
     if index is None:
-        index = Mod.current_device()
+        index = device_module.current_device()
     return f"{name}:{index}"
 
 

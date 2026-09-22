@@ -4,7 +4,7 @@ import os
 import ray
 
 from relax.distributed.ray.ray_actor import RayActor
-from relax.utils.device import Mod
+from relax.utils.device import device_module
 
 
 # Refer to
@@ -31,8 +31,8 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def get_physical_gpu_id():
-    device = Mod.current_device()
-    props = Mod.get_device_properties(device)
+    device = device_module.current_device()
+    props = device_module.get_device_properties(device)
     return str(props.uuid)
 
 

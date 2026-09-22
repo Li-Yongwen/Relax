@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from relax.utils import device as device_utils
-from relax.utils.device import Mod
+from relax.utils.device import device_module
 from relax.utils.log_style import format_role_tag
 from relax.utils.logging_utils import get_logger
 
@@ -27,9 +27,9 @@ def set_role(role: str | None) -> None:
 
 
 def clear_memory(clear_host_memory: bool = False):
-    Mod.synchronize()
+    device_module.synchronize()
     gc.collect()
-    Mod.empty_cache()
+    device_module.empty_cache()
     if clear_host_memory:
         if device_utils.is_npu_available:
             torch.npu.host_empty_cache()
@@ -38,15 +38,15 @@ def clear_memory(clear_host_memory: bool = False):
 
 
 def available_memory():
-    dev = Mod.current_device()
-    free, total = Mod.mem_get_info(dev)
+    dev = device_module.current_device()
+    free, total = device_module.mem_get_info(dev)
     return {
         "device": str(dev),
         "total_GB": _byte_to_gb(total),
         "free_GB": _byte_to_gb(free),
         "used_GB": _byte_to_gb(total - free),
-        "allocated_GB": _byte_to_gb(Mod.memory_allocated(dev)),
-        "reserved_GB": _byte_to_gb(Mod.memory_reserved(dev)),
+        "allocated_GB": _byte_to_gb(device_module.memory_allocated(dev)),
+        "reserved_GB": _byte_to_gb(device_module.memory_reserved(dev)),
     }
 
 
