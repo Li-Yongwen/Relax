@@ -308,10 +308,31 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         """Unanimous drain check over the ranks sharing this DP slot."""
         if partition_id is None:
             partition_id = sft_partition_id(self.args, rollout_id)
-        status = run(self.data_system_client.async_check_consumption_status(task_name, partition_id))
-        flag = torch.tensor([1 if status else 0], dtype=torch.int32)
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_gloo_group() if all_data else self._same_data_group)
-        return bool(flag.item())
+        status = False
+        error = None
+        try:
+            status = run(self.data_system_client.async_check_consumption_status(task_name, partition_id))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        _, pending = self._agree_data_readiness(
+            bool(status),
+            error,
+            group=get_gloo_group() if all_data else self._same_data_group,
+            context=f"Consumption status task={task_name} partition={partition_id}",
+        )
+        return pending == 0
+
+    def _agree_data_readiness(self, ready: bool, error: str | None, *, group, context: str) -> tuple[int, int]:
+        status = [int(ready), int(not ready and error is None), int(error is not None)]
+        tally = torch.tensor(status, dtype=torch.int32, device="cpu")
+        dist.all_reduce(tally, op=dist.ReduceOp.SUM, group=group)
+        ready_count, missing_count, failed_count = tally.tolist()
+        if failed_count:
+            errors = [None] * dist.get_world_size(group)
+            dist.all_gather_object(errors, error, group=group)
+            details = "; ".join(f"group rank {rank}: {message}" for rank, message in enumerate(errors) if message)
+            raise RuntimeError(f"{context} failed: {details}")
+        return ready_count, missing_count
 
     def _fetch_batch_with_agreement(
         self,
@@ -350,16 +371,12 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             return rollout_data
 
         def readiness(ready: bool, error: str | None) -> tuple[int, int]:
-            status = [int(ready), int(not ready and error is None), int(error is not None)]
-            tally = torch.tensor(status, dtype=torch.int32, device="cpu")
-            dist.all_reduce(tally, op=dist.ReduceOp.SUM, group=agreement_group)
-            ready_count, missing_count, failed_count = tally.tolist()
-            if failed_count:
-                errors = [None] * dist.get_world_size(agreement_group)
-                dist.all_gather_object(errors, error, group=agreement_group)
-                details = "; ".join(f"group rank {rank}: {message}" for rank, message in enumerate(errors) if message)
-                raise RuntimeError(f"Data fetch partition={partition_id} batch_index={batch_index} failed: {details}")
-            return ready_count, missing_count
+            return self._agree_data_readiness(
+                ready,
+                error,
+                group=agreement_group,
+                context=f"Data fetch partition={partition_id} batch_index={batch_index}",
+            )
 
         return fetch_with_agreement(
             fetch,
